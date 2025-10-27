@@ -1,0 +1,276 @@
+# -- coding: utf-8 --
+"""
+Smart Gas and Flame Detection System (with Firebase + MQTT)
+------------------------------------------------------------
+Features:
+- Detects gas leaks and flame presence from Arduino sensor data via MQTT
+- Activates buzzer, LED, and fan (servo motor) on alarm
+- Logs alarm events to Firebase Realtime Database
+- Supports remote alarm OFF control via Firebase
+"""
+
+# ---------------- IMPORTS ----------------
+import RPi.GPIO as GPIO          # For Raspberry Pi GPIO control
+import time                      # For delays and timing
+import threading                 # For parallel LED/Buzzer control
+from datetime import datetime    # For timestamp logging
+from paho.mqtt import client as mqtt_client  # For MQTT communication
+import firebase_admin            # For Firebase interaction
+from firebase_admin import credentials, db   # For Firebase database access
+
+# ---------------- GPIO SETUP ----------------
+GPIO.setwarnings(False)          # Disable GPIO warning messages
+GPIO.setmode(GPIO.BCM)           # Use Broadcom (BCM) GPIO numbering
+
+# Define pins
+buzzer_pin = 18                  # Buzzer connected to GPIO 18
+servo_pin = 17                   # Servo motor (fan control) on GPIO 17
+led_pin = 27                     # Alert LED on GPIO 27
+
+# Configure pins as OUTPUT
+GPIO.setup(buzzer_pin, GPIO.OUT)
+GPIO.setup(servo_pin, GPIO.OUT)
+GPIO.setup(led_pin, GPIO.OUT)
+
+# Initialize PWM on servo pin (50Hz frequency)
+servo = GPIO.PWM(servo_pin, 50)
+servo.start(0)                   # Start with servo OFF (0% duty cycle)
+
+# Ensure buzzer and LED are OFF initially
+GPIO.output(led_pin, GPIO.LOW)
+GPIO.output(buzzer_pin, GPIO.LOW)
+
+# ---------------- FIREBASE SETUP ----------------
+# Path to your Firebase Admin SDK JSON key
+cred = credentials.Certificate(
+    "/home/kapish/SmartGasDetection/smart-gas-system-69634-firebase-adminsdk-fbsvc-4198de2679.json"
+)
+
+# Initialize main Firebase app (for control/status)
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://smart-gas-system-69634-default-rtdb.asia-southeast1.firebasedatabase.app/'
+})
+
+# References to main database nodes
+ref_root = db.reference("/SmartGasDetection")  # Root reference
+ref_alarm = ref_root.child("alarm_triggered")  # Child node for alarm control
+
+# Initialize second Firebase app (for logs)
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://smart-gas-logs-69634-default-rtdb.asia-southeast1.firebasedatabase.app/'
+}, name='logs')
+
+# Reference to alert log database
+log_ref = firebase_admin.db.reference("AlertLogs")
+
+# ---------------- MQTT SETUP ----------------
+broker = "localhost"             # Mosquitto broker running locally on Pi
+port = 1883                      # Default MQTT port
+topic = "iot/gas_readings"       # Topic Arduino publishes sensor data to
+client_id = "GasPi"              # Unique MQTT client ID for Raspberry Pi
+
+# ---------------- THRESHOLDS ----------------
+GAS_THRESHOLD = 1000             # Threshold for gas detection (adjust after calibration)
+FLAME_THRESHOLD = 1              # 1 means flame detected, 0 means safe
+
+# ---------------- GLOBAL STATE VARIABLES ----------------
+blink_active = False             # LED blinking state
+buzzer_active = False            # Buzzer active state
+manual_off = False               # Manual alarm OFF flag
+alarm_active = False             # Track if alarm currently triggered
+
+# ---------------- BUZZER CONTROL ----------------
+def buzzer_siren():
+    """Generates a siren sound by varying buzzer frequency."""
+    global buzzer_active
+    p = GPIO.PWM(buzzer_pin, 1000)  # Start PWM at 1 kHz
+    p.start(50)                     # 50% duty cycle for audible tone
+    try:
+        while buzzer_active:        # Continue while alarm active
+            for freq in [1000, 1500, 2000, 2500, 1800]:  # Sweep frequencies
+                if not buzzer_active:  # Stop immediately if alarm deactivated
+                    break
+                p.ChangeFrequency(freq)
+                time.sleep(0.2)      # Short pause between tone changes
+    finally:
+        p.stop()                    # Stop PWM cleanly when done
+
+def start_buzzer():
+    """Start the buzzer thread if not already active."""
+    global buzzer_active
+    if not buzzer_active:           # Prevent duplicate threads
+        buzzer_active = True
+        threading.Thread(target=buzzer_siren, daemon=True).start()
+
+def stop_buzzer():
+    """Immediately stop buzzer sound."""
+    global buzzer_active
+    buzzer_active = False
+    GPIO.output(buzzer_pin, GPIO.LOW)  # Ensure pin is off
+
+# ---------------- LED CONTROL ----------------
+def blink_led():
+    """Continuously blink the LED while blink_active is True."""
+    global blink_active
+    while blink_active:
+        GPIO.output(led_pin, GPIO.HIGH)  # LED ON
+        time.sleep(0.2)
+        GPIO.output(led_pin, GPIO.LOW)   # LED OFF
+        time.sleep(0.2)
+
+# ---------------- ALARM CONTROL ----------------
+def turn_on_alarm(reason="Gas/Flame detected"):
+    """Activate LED, buzzer, fan, and log event in Firebase."""
+    global blink_active, manual_off, alarm_active
+
+    if manual_off or alarm_active:
+        # Skip if manually disabled or already active
+        return
+
+    alarm_active = True              # Mark alarm as active
+    blink_active = True              # Enable LED blinking
+
+    # Start LED blinking in background
+    threading.Thread(target=blink_led, daemon=True).start()
+
+    # Start buzzer siren
+    start_buzzer()
+
+    # Turn ON servo/fan
+    servo.ChangeDutyCycle(7.5)       # Adjust as per your fan/servo
+
+    # Update Firebase live data
+    ref_root.update({
+        "alarm_triggered": True,
+        "fan_status": "ON",
+        "last_triggered": datetime.now().isoformat(),
+    })
+
+    # Log to Firebase (in logs database)
+    log_ref.push({
+        "timestamp": datetime.now().isoformat(),
+        "reason": reason,
+        "status": "Triggered"
+    })
+
+    print(f"ALARM TRIGGERED: {reason}")
+
+def turn_off_alarm(manual=False):
+    """Deactivate LED, buzzer, fan, and clear alarm state."""
+    global blink_active, manual_off, alarm_active
+
+    if not alarm_active:
+        # Prevent duplicate turn-offs
+        return
+
+    alarm_active = False             # Reset alarm flag
+    blink_active = False             # Stop LED blinking
+    stop_buzzer()                    # Stop buzzer
+    GPIO.output(led_pin, GPIO.LOW)   # Turn off LED
+    servo.ChangeDutyCycle(0)         # Stop fan
+
+    if manual:
+        # If user manually turned off alarm, set cooldown for 15s
+        manual_off = True
+        threading.Timer(15, lambda: set_manual_off(False)).start()
+
+    # Update Firebase with new state
+    ref_root.update({
+        "alarm_triggered": False,
+        "fan_status": "OFF"
+    })
+
+    # Log cleared alarm
+    log_ref.push({
+        "timestamp": datetime.now().isoformat(),
+        "reason": "User or Auto-Off",
+        "status": "Cleared"
+    })
+
+    print("Alarm turned OFF.")
+
+def set_manual_off(state):
+    """Enable or disable manual override flag."""
+    global manual_off
+    manual_off = state
+
+# ---------------- MQTT MESSAGE HANDLER ----------------
+def on_message(client, userdata, msg):
+    """Handle incoming MQTT sensor data messages."""
+    try:
+        data = msg.payload.decode()        # Decode MQTT message payload
+        readings = eval(data) if isinstance(data, str) else data
+
+        # Extract values from the received dictionary
+        gas = readings.get("gas", 0)
+        flame = readings.get("flame", 0)
+        temp = readings.get("temp", 0.0)
+        hum = readings.get("hum", 0.0)
+
+        # Print sensor data for debugging
+        print(f"Gas: {gas} | Flame: {flame} | Temp: {temp} °C | Humidity: {hum}%")
+
+        # Update Firebase live readings
+        ref_root.update({
+            "gas_value": gas,
+            "flame_status": flame,
+            "temperature": temp,
+            "humidity": hum
+        })
+
+        # Only trigger alarms if not manually disabled
+        if not manual_off:
+            if gas > GAS_THRESHOLD or flame == FLAME_THRESHOLD:
+                # Alarm ON if gas leak or flame detected
+                turn_on_alarm("Gas or Flame detected")
+            else:
+                # Alarm OFF when safe
+                turn_off_alarm()
+
+    except Exception as e:
+        # Print any errors in MQTT message handling
+        print(" Error processing MQTT message:", e)
+
+# ---------------- MQTT CONNECTION ----------------
+def connect_mqtt():
+    """Connect to MQTT broker and return client instance."""
+    client = mqtt_client.Client(client_id=client_id, protocol=mqtt_client.MQTTv311)
+    client.on_message = on_message          # Attach message callback
+    client.connect(broker, port)            # Connect to local MQTT broker
+    return client
+
+# ---------------- FIREBASE LISTENER ----------------
+def listen_firebase_changes():
+    """Listen for remote alarm OFF commands from Firebase."""
+    def listener(event):
+        data = event.data
+        if data is False:                   # When alarm_triggered set to False remotely
+            print("Remote user turned OFF the alarm.")
+            turn_off_alarm(manual=True)
+
+    # Start listening to alarm_triggered value changes
+    ref_alarm.listen(listener)
+
+# ---------------- MAIN PROGRAM ----------------
+def main():
+    """Initialize MQTT, Firebase, and enter main monitoring loop."""
+    client = connect_mqtt()                 # Connect to MQTT broker
+    client.subscribe(topic)                 # Subscribe to gas reading topic
+    client.loop_start()                     # Start MQTT loop in background
+    listen_firebase_changes()               # Start Firebase listener thread
+
+    print("System initialized. Waiting for sensor readings...")
+    servo.ChangeDutyCycle(0)                # Ensure fan is OFF initially
+
+    try:
+        while True:
+            # Infinite loop keeps program alive
+            time.sleep(1)
+    except KeyboardInterrupt:
+        # Cleanly release GPIO resources on exit
+        GPIO.cleanup()
+        print("Program stopped by user.")
+
+# ---------------- ENTRY POINT ----------------
+if __name__ == "__main__":
+    main()
